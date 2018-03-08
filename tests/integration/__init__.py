@@ -40,6 +40,7 @@ from cassandra.cluster import NoHostAvailable
 from cassandra.protocol import ConfigurationException
 
 try:
+    from ccmlib.dse_cluster import DseCluster
     from ccmlib.cluster import Cluster as CCMCluster
     from ccmlib.cluster_factory import ClusterFactory as CCMClusterFactory
     from ccmlib import common
@@ -95,11 +96,13 @@ USE_CASS_EXTERNAL = bool(os.getenv('USE_CASS_EXTERNAL', False))
 KEEP_TEST_CLUSTER = bool(os.getenv('KEEP_TEST_CLUSTER', False))
 SIMULACRON_JAR = os.getenv('SIMULACRON_JAR', None)
 
-default_cassandra_version = Version('3.11')
+default_cassandra_version = '3.11'
+default_dse_version = '4.8.3'
 
 CASSANDRA_IP = os.getenv('CASSANDRA_IP', '127.0.0.1')
 CASSANDRA_DIR = os.getenv('CASSANDRA_DIR', None)
 CASSANDRA_VERSION = Version(os.getenv('CASSANDRA_VERSION', default_cassandra_version))
+DSE_VERSION = Version(os.getenv('DSE_VERSION', default_dse_version))
 
 CCM_KWARGS = {}
 if CASSANDRA_DIR:
@@ -197,6 +200,11 @@ def get_unsupported_upper_protocol():
     else:
         return None
 
+
+def is_dse():
+    return os.getenv('DSE_VERSION') is not None
+
+
 default_protocol_version = get_default_protocol()
 
 
@@ -222,6 +230,7 @@ notpy3 = unittest.skipIf(sys.version_info >= (3, 0), "Test not applicable for Py
 requiresmallclockgranularity = unittest.skipIf("Windows" in platform.system() or "asyncore" in EVENT_LOOP_MANAGER,
                                                "This test is not suitible for environments with large clock granularity")
 requiressimulacron = unittest.skipIf(SIMULACRON_JAR is None or CASSANDRA_VERSION < Version("2.1"), "Simulacron jar hasn't been specified or C* version is 2.0")
+dseonly = unittest.skipUnless(is_dse(), 'DSE_VERSION has to be set')
 
 
 def wait_for_node_socket(node, timeout):
@@ -300,13 +309,17 @@ def is_current_cluster(cluster_name, node_counts):
 
 
 def use_cluster(cluster_name, nodes, ipformat=None, start=True, workloads=[], set_keyspace=True, ccm_options=None,
-                configuration_options={}):
+                configuration_options={}, dse_cluster=False, dse_options={}):
     set_default_cass_ip()
 
-    if ccm_options is None:
+    if ccm_options is None and dse_cluster:
+        ccm_options = {"version": DSE_VERSION}
+    elif ccm_options is None:
         ccm_options = CCM_KWARGS.copy()
 
     cassandra_version = ccm_options.get('version', CASSANDRA_VERSION)
+    dse_version = ccm_options.get('version', DSE_VERSION)
+
     if 'version' in ccm_options:
         ccm_options['version'] = ccm_options['version'].base_version
 
@@ -339,15 +352,34 @@ def use_cluster(cluster_name, nodes, ipformat=None, start=True, workloads=[], se
             del tb
 
             log.debug("Creating new CCM cluster, {0}, with args {1}".format(cluster_name, ccm_options))
-            CCM_CLUSTER = CCMCluster(path, cluster_name, **ccm_options)
-            CCM_CLUSTER.set_configuration_options({'start_native_transport': True})
-            if cassandra_version >= Version('2.2'):
-                CCM_CLUSTER.set_configuration_options({'enable_user_defined_functions': True})
-                if cassandra_version >= Version('3.0'):
+
+            if dse_cluster:
+                CCM_CLUSTER = DseCluster(path, cluster_name, **ccm_options)
+                CCM_CLUSTER.set_configuration_options({'start_native_transport': True})
+                CCM_CLUSTER.set_configuration_options({'batch_size_warn_threshold_in_kb': 5})
+                if dse_version >= Version('5.0'):
+                    CCM_CLUSTER.set_configuration_options({'enable_user_defined_functions': True})
                     CCM_CLUSTER.set_configuration_options({'enable_scripted_user_defined_functions': True})
-            common.switch_cluster(path, cluster_name)
-            CCM_CLUSTER.set_configuration_options(configuration_options)
-            CCM_CLUSTER.populate(nodes, ipformat=ipformat)
+                if 'spark' in workloads:
+                    config_options = {"initial_spark_worker_resources": 0.1}
+                    CCM_CLUSTER.set_dse_configuration_options(config_options)
+                common.switch_cluster(path, cluster_name)
+                CCM_CLUSTER.set_configuration_options(configuration_options)
+                CCM_CLUSTER.populate(nodes, ipformat=ipformat)
+
+                CCM_CLUSTER.set_dse_configuration_options(dse_options)
+            else:
+                log.debug("Creating new CCM cluster, {0}, with args {1}".format(cluster_name, ccm_options))
+                CCM_CLUSTER = CCMCluster(path, cluster_name, **ccm_options)
+                CCM_CLUSTER.set_configuration_options({'start_native_transport': True})
+                if cassandra_version >= Version('2.2'):
+                    CCM_CLUSTER.set_configuration_options({'enable_user_defined_functions': True})
+                    if cassandra_version >= Version('3.0'):
+                        CCM_CLUSTER.set_configuration_options({'enable_scripted_user_defined_functions': True})
+                common.switch_cluster(path, cluster_name)
+                CCM_CLUSTER.set_configuration_options(configuration_options)
+                CCM_CLUSTER.populate(nodes, ipformat=ipformat)
+
     try:
         jvm_args = []
         # This will enable the Mirroring query handler which will echo our custom payload k,v pairs back
